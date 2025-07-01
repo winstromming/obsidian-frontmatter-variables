@@ -1,134 +1,320 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import { debounce, MarkdownView, Plugin, TFile } from "obsidian";
 
-// Remember to rename these classes and interfaces!
+const ATTR_KEY = "data-frontmatter-variable-key";
+const ATTR_PREFIX = "data-frontmatter-variable-prefix";
+const ATTR_SPREAD = "data-frontmatter-variable-spread";
 
-interface MyPluginSettings {
-	mySetting: string;
-}
+const PREFIX_SYMBOL = "!";
+const SPREAD_SYMBOL = "...";
 
-const DEFAULT_SETTINGS: MyPluginSettings = {
-	mySetting: 'default'
-}
-
-export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
+export default class FrontmatterVariables extends Plugin {
+	debounced = debounce(this.find.bind(this), 100, true);
 
 	async onload() {
-		await this.loadSettings();
-
-		// This creates an icon in the left ribbon.
-		const ribbonIconEl = this.addRibbonIcon('dice', 'Sample Plugin', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
+		this.registerMarkdownPostProcessor((element, context) => {
+			const file = this.app.vault.getFileByPath(context.sourcePath);
+			if (!file) return;
+			const attempt = (attempts = 0) => {
+				const cache = this.app.metadataCache.getFileCache(file);
+				if (cache?.frontmatter) {
+					this.replace(element);
+					this.update(element, cache.frontmatter);
+				} else if (attempts < 5) {
+					setTimeout(() => attempt(attempts + 1), 250);
+				}
+			};
+			attempt();
 		});
-		// Perform additional things with the ribbon
-		ribbonIconEl.addClass('my-plugin-ribbon-class');
 
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status Bar Text');
+		this.registerEvent(
+			this.app.metadataCache.on("changed", (file) => this.refresh(file))
+		);
+		this.registerEvent(
+			this.app.metadataCache.on("resolve", (file) => this.refresh(file))
+		);
 
-		// This adds a simple command that can be triggered anywhere
-		this.addCommand({
-			id: 'open-sample-modal-simple',
-			name: 'Open sample modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
-			}
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'sample-editor-command',
-			name: 'Sample editor command',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				console.log(editor.getSelection());
-				editor.replaceSelection('Sample Editor Command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-sample-modal-complex',
-			name: 'Open sample modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
+		this.registerEvent(
+			this.app.workspace.on("active-leaf-change", (leaf) => {
+				if (
+					leaf?.view instanceof MarkdownView &&
+					leaf?.view.getMode() === "preview"
+				)
+					this.debounced();
+			})
+		);
+	}
+
+	refresh(file: TFile) {
+		const view = this.app?.workspace?.getActiveViewOfType(MarkdownView);
+		if (view?.file?.path === file.path && view?.getMode() === "preview") {
+			view.previewMode.rerender(true);
+			setTimeout(() => this.debounced(file), 50);
+		}
+	}
+
+	linkify(str: string | number): string {
+		if (typeof str === "string" && /^\[\[[^\]]+\]\]$/.test(str.trim())) {
+			const match = str.match(/^\[\[([^\]|]+)(\|([^\]]+))?\]\]$/);
+			if (!match) return str;
+			const target = match[1].trim();
+			const display = match[3] ? match[3].trim() : target;
+			return `<a class="internal-link" data-href="${display}" href="${display}">${display}</a>`;
+		}
+		return typeof str === "string" ? str : String(str);
+	}
+
+	replace(element: HTMLElement) {
+		const escapedSpread = SPREAD_SYMBOL.replace(
+			/[.*+?^${}()|[\]\\]/g,
+			"\\$&"
+		);
+		const pattern = new RegExp(
+			`\\{\\{\\s*${PREFIX_SYMBOL}?\\s*([\\w\\s\\+\\-_.]+?)\\s*(${escapedSpread})?\\s*\\}\\}`,
+			"g"
+		);
+		const textNodes: Text[] = [];
+		const walker = document.createTreeWalker(
+			element,
+			NodeFilter.SHOW_TEXT,
+			{
+				acceptNode: (node) => {
+					const parent = node.parentElement;
+					if (
+						parent?.tagName === "CODE" ||
+						parent?.tagName === "PRE" ||
+						parent?.closest("code, pre") ||
+						parent?.dataset?.property
+					) {
+						return NodeFilter.FILTER_REJECT;
 					}
+					return NodeFilter.FILTER_ACCEPT;
+				},
+			}
+		);
+		let node: Text | null;
+		while ((node = walker.nextNode() as Text | null)) {
+			textNodes.push(node);
+		}
+		for (const textNode of textNodes) {
+			const text = textNode.nodeValue;
+			if (!text || !text.includes("{{")) continue;
+			let match;
+			let lastIndex = 0;
+			let found = false;
+			pattern.lastIndex = 0;
+			const fragment = document.createDocumentFragment();
+			while ((match = pattern.exec(text)) !== null) {
+				found = true;
+				let [fullMatch, key] = match;
+				if (key.startsWith(`${PREFIX_SYMBOL}`))
+					key = key.slice(PREFIX_SYMBOL.length);
+				if (key.startsWith(` ${PREFIX_SYMBOL}`))
+					key = key.slice(PREFIX_SYMBOL.length + 1);
+				if (key.endsWith(`${SPREAD_SYMBOL}`))
+					key = key.slice(0, -SPREAD_SYMBOL.length);
+				if (key.endsWith(`${SPREAD_SYMBOL} `))
+					key = key.slice(0, -(SPREAD_SYMBOL.length + 1));
+				key = key.trim();
+				if (match.index > lastIndex) {
+					fragment.appendChild(
+						document.createTextNode(
+							text.slice(lastIndex, match.index)
+						)
+					);
+				}
+				const span = document.createElement("span");
+				span.setAttribute(ATTR_KEY, key);
+				if (
+					fullMatch.startsWith(`{{${PREFIX_SYMBOL}`) ||
+					fullMatch.startsWith(`{{ ${PREFIX_SYMBOL}`)
+				)
+					span.setAttribute(ATTR_PREFIX, "true");
+				if (
+					fullMatch.endsWith(`${SPREAD_SYMBOL}}}`) ||
+					fullMatch.endsWith(`${SPREAD_SYMBOL} }}`)
+				)
+					span.setAttribute(ATTR_SPREAD, "true");
+				fragment.appendChild(span);
+				lastIndex = match.index + fullMatch.length;
+			}
+			if (found) {
+				if (lastIndex < text.length) {
+					fragment.appendChild(
+						document.createTextNode(text.slice(lastIndex))
+					);
+				}
+				textNode.parentNode?.replaceChild(fragment, textNode);
+			}
+		}
+	}
 
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
+	parse(
+		key: string,
+		frontmatter: Record<string, any>
+	): string | number | string[] | number[] | undefined {
+		const parts = key
+			.split(/([+-])/)
+			.map((s) => s.trim())
+			.filter(Boolean);
+		if (parts.length === 1) {
+			let v = frontmatter[parts[0]];
+			if (v === undefined) {
+				const num = Number(parts[0]);
+				v = !isNaN(num) && parts[0].trim() !== "" ? num : parts[0];
+			}
+			return v;
+		}
+
+		let values: any[] = [];
+		let ops: string[] = [];
+		for (let i = 0; i < parts.length; i++) {
+			if (i % 2 === 0) {
+				let v = frontmatter[parts[i]];
+				if (v === undefined) {
+					const num = Number(parts[i]);
+					v = !isNaN(num) && parts[i].trim() !== "" ? num : parts[i];
+				}
+				values.push(v);
+			} else {
+				ops.push(parts[i]);
+			}
+		}
+
+		if (values.some((v) => v === undefined || v === null)) return undefined;
+
+		if (values.some(Array.isArray)) {
+			let result: any[] = Array.isArray(values[0])
+				? [...values[0]]
+				: [values[0]];
+			for (let i = 1; i < values.length; i++) {
+				let val = values[i];
+				if (!Array.isArray(val)) val = [val];
+				if (ops[i - 1] === "+") result = result.concat(val);
+				else if (ops[i - 1] === "-")
+					result = result.filter((x) => !val.includes(x));
+			}
+			return result;
+		}
+		if (values.every((v) => typeof v === "number")) {
+			let result = values[0];
+			for (let i = 1; i < values.length; i++) {
+				if (ops[i - 1] === "+") result += values[i];
+				else if (ops[i - 1] === "-") result -= values[i];
+			}
+			return result;
+		}
+		if (values.every((v) => typeof v === "string")) {
+			let result = values[0];
+			for (let i = 1; i < values.length; i++) {
+				if (ops[i - 1] === "+") result += " " + values[i];
+				else if (ops[i - 1] === "-")
+					result = result.replace(values[i], "");
+			}
+			return result;
+		}
+		return values.join(" ");
+	}
+
+	update(
+		element: Element,
+		frontmatter: Record<string, string | number | string[] | number[]>
+	) {
+		const spans = Array.from(
+			element.querySelectorAll("span[" + ATTR_KEY + "]")
+		);
+		for (const span of spans) {
+			const key = span.getAttribute(ATTR_KEY);
+			const prefix = span.getAttribute(ATTR_PREFIX);
+			const spread = span.getAttribute(ATTR_SPREAD);
+			if (!key) continue;
+
+			const value = this.parse(key, frontmatter);
+
+			while (span.firstChild) span.removeChild(span.firstChild);
+			if (value === undefined || value === null) continue;
+
+			const appendPrefix = () => {
+				const b = document.createElement("b");
+				b.textContent = capitalise(key) + ": ";
+				span.appendChild(b);
+				if (Array.isArray(value) && !spread)
+					span.appendChild(document.createElement("br"));
+			};
+			if (Array.isArray(value)) {
+				if (prefix) appendPrefix();
+				value.forEach((item, idx) => {
+					const rendered = this.linkify(item);
+					if (/<[a-z][\s\S]*>/i.test(rendered)) {
+						const parser = new DOMParser();
+						const doc = parser.parseFromString(
+							rendered,
+							"text/html"
+						);
+						Array.from(doc.body.childNodes).forEach((node) =>
+							span.appendChild(node)
+						);
+					} else {
+						span.appendChild(document.createTextNode(rendered));
+					}
+					if (idx < value.length - 1) {
+						if (spread) {
+							span.appendChild(document.createTextNode(", "));
+						} else {
+							span.appendChild(document.createElement("br"));
+						}
+					}
+				});
+			} else {
+				if (prefix) appendPrefix();
+				const rendered = this.linkify(value);
+				if (/<[a-z][\s\S]*>/i.test(rendered)) {
+					const parser = new DOMParser();
+					const doc = parser.parseFromString(rendered, "text/html");
+					Array.from(doc.body.childNodes).forEach((node) =>
+						span.appendChild(node)
+					);
+				} else {
+					span.appendChild(
+						document.createTextNode(
+							rendered === value
+								? escape(String(value))
+								: rendered
+						)
+					);
 				}
 			}
-		});
+		}
+	}
 
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
-
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			console.log('click', evt);
-		});
-
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
+	async find(file: TFile) {
+		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (!view || view.getMode() !== "preview") return;
+		if (file && view.file?.path !== file.path) return;
+		const current = view.file;
+		if (!current) return;
+		const cache = this.app.metadataCache.getFileCache(current);
+		const frontmatter = cache?.frontmatter || {};
+		const previewing = view.containerEl.querySelector(
+			".markdown-preview-view"
+		);
+		if (!previewing) return;
+		this.update(previewing, frontmatter);
 	}
 
 	onunload() {
-
-	}
-
-	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-	}
-
-	async saveSettings() {
-		await this.saveData(this.settings);
+		if (this.debounced) {
+			this.debounced.cancel();
+		}
 	}
 }
 
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
-	}
+const escape = (str: string) => str.replace(/[&<>"']/g, (c) => escapes[c] || c);
+const capitalise = (str: string) => str.charAt(0).toUpperCase() + str.slice(1);
 
-	onOpen() {
-		const {contentEl} = this;
-		contentEl.setText('Woah!');
-	}
-
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
-	}
-}
-
-class SampleSettingTab extends PluginSettingTab {
-	plugin: MyPlugin;
-
-	constructor(app: App, plugin: MyPlugin) {
-		super(app, plugin);
-		this.plugin = plugin;
-	}
-
-	display(): void {
-		const {containerEl} = this;
-
-		containerEl.empty();
-
-		new Setting(containerEl)
-			.setName('Setting #1')
-			.setDesc('It\'s a secret')
-			.addText(text => text
-				.setPlaceholder('Enter your secret')
-				.setValue(this.plugin.settings.mySetting)
-				.onChange(async (value) => {
-					this.plugin.settings.mySetting = value;
-					await this.plugin.saveSettings();
-				}));
-	}
-}
+const escapes: Record<string, string> = {
+	"&": "&amp;",
+	"<": "&lt;",
+	">": "&gt;",
+	'"': "&quot;",
+	"'": "&#39;",
+};
