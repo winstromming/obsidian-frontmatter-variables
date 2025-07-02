@@ -1,13 +1,75 @@
 import { debounce, MarkdownView, Plugin, TFile } from "obsidian";
+import { parse, render } from "./functions";
 
 const ATTR_KEY = "data-frontmatter-variable-key";
 const ATTR_PREFIX = "data-frontmatter-variable-prefix";
-const ATTR_SPREAD = "data-frontmatter-variable-spread";
-
 const PREFIX_SYMBOL = "!";
-const SPREAD_SYMBOL = "...";
 
-export default class FrontmatterVariables extends Plugin {
+// Regex for matching {{variable}} or {{!variable}}
+const TEMPLATE_PATTERN = new RegExp(
+	`\{\{\s*${PREFIX_SYMBOL}?\s*([^}}]+?)\s*\}\}`,
+	"g"
+);
+
+// Helper to parse key and prefix from a match
+function parseKeyAndPrefix(
+	fullMatch: string,
+	key: string
+): { key: string; prefix: boolean } {
+	let prefix = false;
+	key = key.trim();
+	if (key.startsWith(`${PREFIX_SYMBOL}`)) {
+		key = key.slice(PREFIX_SYMBOL.length);
+		prefix = true;
+	}
+	if (
+		fullMatch.startsWith(`{{${PREFIX_SYMBOL}`) ||
+		fullMatch.startsWith(`{{ ${PREFIX_SYMBOL}`)
+	) {
+		prefix = true;
+	}
+	return { key, prefix };
+}
+
+// Helper to find all text nodes in an element (excluding code/pre)
+function findTextNodes(element: HTMLElement): Text[] {
+	const textNodes: Text[] = [];
+	const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT, {
+		acceptNode: (node) => {
+			const parent = node.parentElement;
+			if (
+				parent?.tagName === "CODE" ||
+				parent?.tagName === "PRE" ||
+				parent?.closest("code, pre") ||
+				parent?.dataset?.property
+			) {
+				return NodeFilter.FILTER_REJECT;
+			}
+			return NodeFilter.FILTER_ACCEPT;
+		},
+	});
+	let node: Text | null;
+	while ((node = walker.nextNode() as Text | null)) textNodes.push(node);
+	return textNodes;
+}
+
+// Helper to update a single span
+function updateSpan(span: Element, frontmatter: Record<string, any>) {
+	const key = span.getAttribute(ATTR_KEY);
+	const prefix = span.getAttribute(ATTR_PREFIX);
+	if (!key) return;
+	const value = parse(key, frontmatter);
+	if (value === undefined || value === null) return;
+	while (span.firstChild) span.removeChild(span.firstChild);
+	const frag = render(value, key, !!prefix, { toDOM: true });
+	if (typeof frag === "string") {
+		span.appendChild(document.createTextNode(frag));
+	} else {
+		span.appendChild(frag);
+	}
+}
+
+export default class FrontmatterVariablesPlugin extends Plugin {
 	debounced = debounce(this.find.bind(this), 100, true);
 
 	async onload() {
@@ -52,69 +114,23 @@ export default class FrontmatterVariables extends Plugin {
 		}
 	}
 
-	linkify(str: string | number): string {
-		if (typeof str === "string" && /^\[\[[^\]]+\]\]$/.test(str.trim())) {
-			const match = str.match(/^\[\[([^\]|]+)(\|([^\]]+))?\]\]$/);
-			if (!match) return str;
-			const target = match[1].trim();
-			const display = match[3] ? match[3].trim() : target;
-			return `<a class="internal-link" data-href="${display}" href="${display}">${display}</a>`;
-		}
-		return typeof str === "string" ? str : String(str);
-	}
-
 	replace(element: HTMLElement) {
-		const escapedSpread = SPREAD_SYMBOL.replace(
-			/[.*+?^${}()|[\]\\]/g,
-			"\\$&"
-		);
-		const pattern = new RegExp(
-			`\\{\\{\\s*${PREFIX_SYMBOL}?\\s*([\\w\\s\\+\\-_.]+?)\\s*(${escapedSpread})?\\s*\\}\\}`,
-			"g"
-		);
-		const textNodes: Text[] = [];
-		const walker = document.createTreeWalker(
-			element,
-			NodeFilter.SHOW_TEXT,
-			{
-				acceptNode: (node) => {
-					const parent = node.parentElement;
-					if (
-						parent?.tagName === "CODE" ||
-						parent?.tagName === "PRE" ||
-						parent?.closest("code, pre") ||
-						parent?.dataset?.property
-					) {
-						return NodeFilter.FILTER_REJECT;
-					}
-					return NodeFilter.FILTER_ACCEPT;
-				},
-			}
-		);
-		let node: Text | null;
-		while ((node = walker.nextNode() as Text | null)) {
-			textNodes.push(node);
-		}
+		const textNodes = findTextNodes(element);
 		for (const textNode of textNodes) {
 			const text = textNode.nodeValue;
 			if (!text || !text.includes("{{")) continue;
 			let match;
 			let lastIndex = 0;
 			let found = false;
-			pattern.lastIndex = 0;
+			TEMPLATE_PATTERN.lastIndex = 0;
 			const fragment = document.createDocumentFragment();
-			while ((match = pattern.exec(text)) !== null) {
+			while ((match = TEMPLATE_PATTERN.exec(text)) !== null) {
 				found = true;
-				let [fullMatch, key] = match;
-				if (key.startsWith(`${PREFIX_SYMBOL}`))
-					key = key.slice(PREFIX_SYMBOL.length);
-				if (key.startsWith(` ${PREFIX_SYMBOL}`))
-					key = key.slice(PREFIX_SYMBOL.length + 1);
-				if (key.endsWith(`${SPREAD_SYMBOL}`))
-					key = key.slice(0, -SPREAD_SYMBOL.length);
-				if (key.endsWith(`${SPREAD_SYMBOL} `))
-					key = key.slice(0, -(SPREAD_SYMBOL.length + 1));
-				key = key.trim();
+				const [fullMatch, key] = match;
+				const { key: parsedKey, prefix } = parseKeyAndPrefix(
+					fullMatch,
+					key
+				);
 				if (match.index > lastIndex) {
 					fragment.appendChild(
 						document.createTextNode(
@@ -123,17 +139,8 @@ export default class FrontmatterVariables extends Plugin {
 					);
 				}
 				const span = document.createElement("span");
-				span.setAttribute(ATTR_KEY, key);
-				if (
-					fullMatch.startsWith(`{{${PREFIX_SYMBOL}`) ||
-					fullMatch.startsWith(`{{ ${PREFIX_SYMBOL}`)
-				)
-					span.setAttribute(ATTR_PREFIX, "true");
-				if (
-					fullMatch.endsWith(`${SPREAD_SYMBOL}}}`) ||
-					fullMatch.endsWith(`${SPREAD_SYMBOL} }}`)
-				)
-					span.setAttribute(ATTR_SPREAD, "true");
+				span.setAttribute(ATTR_KEY, parsedKey);
+				if (prefix) span.setAttribute(ATTR_PREFIX, "true");
 				fragment.appendChild(span);
 				lastIndex = match.index + fullMatch.length;
 			}
@@ -148,151 +155,20 @@ export default class FrontmatterVariables extends Plugin {
 		}
 	}
 
-	parse(
-		key: string,
-		frontmatter: Record<string, any>
-	): string | number | string[] | number[] | undefined {
-		const parts = key
-			.split(/([+-])/)
-			.map((s) => s.trim())
-			.filter(Boolean);
-		if (parts.length === 1) {
-			let v = frontmatter[parts[0]];
-			if (v === undefined) {
-				const num = Number(parts[0]);
-				v = !isNaN(num) && parts[0].trim() !== "" ? num : parts[0];
-			}
-			return v;
-		}
-
-		let values: any[] = [];
-		let ops: string[] = [];
-		for (let i = 0; i < parts.length; i++) {
-			if (i % 2 === 0) {
-				let v = frontmatter[parts[i]];
-				if (v === undefined) {
-					const num = Number(parts[i]);
-					v = !isNaN(num) && parts[i].trim() !== "" ? num : parts[i];
-				}
-				values.push(v);
-			} else {
-				ops.push(parts[i]);
-			}
-		}
-
-		if (values.some((v) => v === undefined || v === null)) return undefined;
-
-		if (values.some(Array.isArray)) {
-			let result: any[] = Array.isArray(values[0])
-				? [...values[0]]
-				: [values[0]];
-			for (let i = 1; i < values.length; i++) {
-				let val = values[i];
-				if (!Array.isArray(val)) val = [val];
-				if (ops[i - 1] === "+") result = result.concat(val);
-				else if (ops[i - 1] === "-")
-					result = result.filter((x) => !val.includes(x));
-			}
-			return result;
-		}
-		if (values.every((v) => typeof v === "number")) {
-			let result = values[0];
-			for (let i = 1; i < values.length; i++) {
-				if (ops[i - 1] === "+") result += values[i];
-				else if (ops[i - 1] === "-") result -= values[i];
-			}
-			return result;
-		}
-		if (values.every((v) => typeof v === "string")) {
-			let result = values[0];
-			for (let i = 1; i < values.length; i++) {
-				if (ops[i - 1] === "+") result += " " + values[i];
-				else if (ops[i - 1] === "-")
-					result = result.replace(values[i], "");
-			}
-			return result;
-		}
-		return values.join(" ");
-	}
-
-	update(
-		element: Element,
-		frontmatter: Record<string, string | number | string[] | number[]>
-	) {
+	update(element: Element, frontmatter: Record<string, any>) {
 		const spans = Array.from(
 			element.querySelectorAll("span[" + ATTR_KEY + "]")
 		);
 		for (const span of spans) {
-			const key = span.getAttribute(ATTR_KEY);
-			const prefix = span.getAttribute(ATTR_PREFIX);
-			const spread = span.getAttribute(ATTR_SPREAD);
-			if (!key) continue;
-
-			const value = this.parse(key, frontmatter);
-
-			while (span.firstChild) span.removeChild(span.firstChild);
-			if (value === undefined || value === null) continue;
-
-			const appendPrefix = () => {
-				const b = document.createElement("b");
-				b.textContent = capitalise(key) + ": ";
-				span.appendChild(b);
-				if (Array.isArray(value) && !spread)
-					span.appendChild(document.createElement("br"));
-			};
-			if (Array.isArray(value)) {
-				if (prefix) appendPrefix();
-				value.forEach((item, idx) => {
-					const rendered = this.linkify(item);
-					if (/<[a-z][\s\S]*>/i.test(rendered)) {
-						const parser = new DOMParser();
-						const doc = parser.parseFromString(
-							rendered,
-							"text/html"
-						);
-						Array.from(doc.body.childNodes).forEach((node) =>
-							span.appendChild(node)
-						);
-					} else {
-						span.appendChild(document.createTextNode(rendered));
-					}
-					if (idx < value.length - 1) {
-						if (spread) {
-							span.appendChild(document.createTextNode(", "));
-						} else {
-							span.appendChild(document.createElement("br"));
-						}
-					}
-				});
-			} else {
-				if (prefix) appendPrefix();
-				const rendered = this.linkify(value);
-				if (/<[a-z][\s\S]*>/i.test(rendered)) {
-					const parser = new DOMParser();
-					const doc = parser.parseFromString(rendered, "text/html");
-					Array.from(doc.body.childNodes).forEach((node) =>
-						span.appendChild(node)
-					);
-				} else {
-					span.appendChild(
-						document.createTextNode(
-							rendered === value
-								? escape(String(value))
-								: rendered
-						)
-					);
-				}
-			}
+			updateSpan(span, frontmatter);
 		}
 	}
 
-	async find(file: TFile) {
+	async find(file: TFile | null) {
 		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-		if (!view || view.getMode() !== "preview") return;
-		if (file && view.file?.path !== file.path) return;
-		const current = view.file;
-		if (!current) return;
-		const cache = this.app.metadataCache.getFileCache(current);
+		if (!view || !view.file || view.getMode() !== "preview") return;
+		if (file && view.file?.path !== file?.path) return;
+		const cache = this.app.metadataCache.getFileCache(view.file);
 		const frontmatter = cache?.frontmatter || {};
 		const previewing = view.containerEl.querySelector(
 			".markdown-preview-view"
@@ -302,19 +178,6 @@ export default class FrontmatterVariables extends Plugin {
 	}
 
 	onunload() {
-		if (this.debounced) {
-			this.debounced.cancel();
-		}
+		this.debounced.cancel();
 	}
 }
-
-const escape = (str: string) => str.replace(/[&<>"']/g, (c) => escapes[c] || c);
-const capitalise = (str: string) => str.charAt(0).toUpperCase() + str.slice(1);
-
-const escapes: Record<string, string> = {
-	"&": "&amp;",
-	"<": "&lt;",
-	">": "&gt;",
-	'"': "&quot;",
-	"'": "&#39;",
-};
